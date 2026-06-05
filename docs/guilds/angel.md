@@ -12,4 +12,4 @@ The angel guild package is a skeleton implementation. All guild files are presen
 
 The angel guild loads cleanly into the common systems but has no unique aliases, strategies, or heartbeat logic defined yet. Combat relies entirely on the common action queue and bot.
 
-To add angel-specific automation, see [Guild File Structure](./structure.md) and the [guild template](./template.md).
+To add angel-specific automation, see [Guild File Structure](./structure.md).

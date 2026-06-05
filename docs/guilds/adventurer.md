@@ -12,4 +12,4 @@ The adventurer guild package is a skeleton implementation. No guild-specific ali
 
 All files are present (actions, aliases, gags, heartbeat, miphp, strategy, tickers) but contain only empty class blocks and a placeholder strategy list entry. The guild is fully supported by the loading system; it just hasn't had guild-specific scripts written yet.
 
-If you play an adventurer and want to add automation, see [Guild File Structure](./structure.md) and the [guild template](./template.md).
+If you play an adventurer and want to add automation, see [Guild File Structure](./structure.md).
