@@ -6,204 +6,84 @@ sidebar_position: 2
 
 # Guild File Structure
 
-Each guild lives in `common/guilds/<guild>/` and provides a standardized set of files. All guild code runs in named TinTin++ classes so it can be cleanly swapped at runtime with `.gswap`.
-
-## How the template works
-
-The `common/guilds/guild template/` folder is a complete, runnable skeleton. Copy it, rename the folder, and fill in each file. The files are designed to be independent — you can implement one at a time and the guild will still load.
-
-### Step-by-step
-
-1. Copy `common/guilds/guild template/` to `common/guilds/myguild/`
-2. In `index.tin`, replace `$guild` (it resolves at load time) — no change needed unless you add optional files
-3. Fill in each file below, starting with `aliases.tin` and `strategy.tin`
-4. Register aliases in the library with `.add_library` calls inside `#if {"$guild" == "myguild"}` guards
-5. Set `#var guild myguild` in your character file and reload
+Understanding the guild system means understanding two things: the **class system** that makes swapping safe, and the **tick/round loop** that drives all combat automation. Everything else in the file structure follows from those two.
 
 ---
 
-## `index.tin` — the entry point
+## The class system: why every file starts with `kill`
 
-`common/index.tin` reads exactly one file per guild:
+TinTin++ stores aliases, actions, and gags as a flat list. There is no namespacing. If you load a bard alias called `pd` and then load a necromancer alias also called `pd`, you have two aliases named `pd` and neither is reliably which one you want.
 
-```tintin
-#read common/guilds/$guild/index.tin
-```
-
-The `index.tin` in the template then reads all the other files:
-
-```tintin
-#read common/guilds/$guild/aliases.tin;
-#read common/guilds/$guild/actions.tin;
-#read common/guilds/$guild/gags.tin;
-#read common/guilds/$guild/heartbeat.tin;
-#read common/guilds/$guild/miphp.tin;
-#read common/guilds/$guild/tickers.tin;
-```
-
-**What `strategy.tin` is not listed here:** strategy.tin is read separately by the common strategy system, not by index.tin. If your guild has a strategy file, add it to `index.tin` yourself:
-
-```tintin
-#read common/guilds/$guild/strategy.tin;
-```
-
-The order matters — `aliases.tin` before `heartbeat.tin` so the heartbeat can call aliases you define.
-
----
-
-## `aliases.tin` — class: `guild_aliases`
-
-Guild-specific commands. The class wrapper is mandatory:
+The class system solves this by tagging every definition with a named group. Every guild file opens with:
 
 ```tintin
 #class {guild_aliases} {kill}
 #class {guild_aliases} {open}
-
-#alias {myspell} {cast fireball};
-#alias {mybuff %1} {cast giant strength on %1};
-
+...definitions...
 #class {guild_aliases} {close}
 ```
 
-**Why `kill` before `open`:** The `kill` line destroys any previously-loaded `guild_aliases` class before loading the new one. This is what makes `.gswap` work — the old guild's aliases are killed first. Never skip the `kill` line.
+- `{kill}` destroys everything currently in the `guild_aliases` class before anything new is loaded. If this is the first load, nothing is killed — but if you loaded bard five minutes ago and are now loading necromancer, all bard aliases are gone before any necromancer alias is registered.
+- `{open}` makes the named class the active container — all aliases, actions, and gags defined after this line belong to it.
+- `{close}` stops adding to that class.
 
-**Registering in the library:** Wrap your `.add_library` calls in a guild check so they only show up for your guild:
+This is what makes `.gswap` work. The swap command calls `.kill_guild_classes`, which kills every `guild_*` class, then reads the new guild's `index.tin`. All of the old guild's definitions are gone before the new ones load.
 
-```tintin
-#if {"$guild" == "myguild"} {
-    .add_library {myspell} {guild} {cast fireball} {myspell} {common/guilds/myguild/aliases.tin};
-};
-```
+**Never skip the `kill` line.** Without it, aliases from previous guilds accumulate. You will have working definitions from three different guilds at once and they will step on each other.
 
 ---
 
-## `actions.tin` — class: `guild_actions`
+## The tick loop: what actually drives combat
 
-Trigger patterns that match MUD output. Typical uses:
-- Detect when a guild proc fires (damage, heal, effect)
-- Parse HP/resource output for guild-specific resources
-- Respond to mob-specific messages
+The main heartbeat is a 2-second `#ticker` defined in `common/miphp.tin`. Every 2 seconds, unconditionally, it calls:
 
-```tintin
-#class {guild_actions} {kill}
-#class {guild_actions} {open}
-
-#action {^Your fireball scorches %* for %d damage!} {
-    #math stats[fireball_dmg] {$stats[fireball_dmg] + %2};
-};
-
-#class {guild_actions} {close}
+```
+_player_miphp          — update MIP display values
+_player_heartbeat      — common per-player logic
+_guild_heartbeat       — YOUR guild's heartbeat (every tick)
+_common_heartbeat      — shared per-round housekeeping
+_update_corpse_string  — recount corpses
+_update_fight_status   — update combat display
+_strategy_heartbeat    — round-gated strategy dispatch
+_update_eternal_status — (if eternal is loaded)
+_guild_miphp           — (if guild_miphp == 1)
 ```
 
-Actions defined here are killed and reloaded by `.gswap`, so they won't bleed into other guilds.
+Then immediately after all of those run:
+
+```tintin
+#var action_round $mip[round];
+```
+
+This line is the key to how "once per round" logic works across the whole system. `$mip[round]` is the current combat round number. `$action_round` is the round number that was current when the last tick ran.
+
+When a new combat round begins, `$mip[round]` increments — but `$action_round` still holds the previous value. Any code that checks `$action_round < $mip[round]` is true for exactly one tick: the first tick after the round advances. After that tick, `action_round` is updated to match `mip[round]`, and the check is false again until the next round.
 
 ---
 
-## `gags.tin` — class: `guild_gags`
+## `_guild_heartbeat` vs `_strategy_guild`: the critical difference
 
-Suppress guild-specific spam. Each `#gag` pattern matches one line of MUD output and suppresses it:
+These two hooks look similar but have completely different timing:
 
-```tintin
-#class {guild_gags} {kill}
-#class {guild_gags} {open}
+| Hook | Called from | When it runs |
+|---|---|---|
+| `_guild_heartbeat` | The 2-second ticker directly | Every tick, regardless of combat round |
+| `_strategy_guild` | `_strategy_heartbeat` | Once per round, only when `action_round < mip[round]` |
 
-#gag {^Your spell fizzles harmlessly.$}
-#gag {^You begin to chant...$}
-
-#class {guild_gags} {close}
-```
-
-Keep gags as specific as possible — overly broad patterns will suppress output you want to see.
-
----
-
-## `heartbeat.tin` — class: `guild_heartbeat`
-
-The per-round hook. The common strategy system calls `_guild_heartbeat` every round. This is where you maintain buffs, manage resources, and make decisions that don't fit neatly into the action queue.
-
-The template gives you the minimum viable heartbeat:
-
-```tintin
-#class {guild_heartbeat} {kill}
-#class {guild_heartbeat} {open}
-
-#alias {_guild_heartbeat} {
-    #if !$idle_flag {
-        #NOP;
-    };
-};
-
-#class {guild_heartbeat} {close}
-```
-
-**`$idle_flag`:** Set to 1 when the bot is paused. Always guard your heartbeat logic with `#if !$idle_flag` so you don't take actions when the bot is stopped.
-
-**Per-round vs. any-tick logic:** The heartbeat fires every tick, not just once per round. To only do something once per round, gate on `$action_round < $mip[round]`:
+**`_guild_heartbeat`** is the right place for things that need to happen continuously — maintaining defences, watching for a proc, managing resources between rounds. It runs whether or not you are in combat, whether or not the round has advanced. The standard guard is:
 
 ```tintin
 #alias {_guild_heartbeat} {
     #if !$idle_flag {
-        #NOP -- runs every tick;
+        // This runs every 2 seconds as long as the bot is active
         #if {$defs[blink] && !$my[prots][blink]} {cast blink};
-
-        #NOP -- runs once per round;
-        #if {$action_round < $mip[round] && $mip[round] > 0} {
-            add_action {{{name} {my_nuke} {action} {cast fireball} {priority} {5}}};
-        };
     };
 };
 ```
 
-**Common patterns in production guilds:**
-
-| Pattern | Example |
-|---|---|
-| Auto-recast a defence | `#if {$defs[mb] && !$my[prots][MB]} {cast mindblank}` |
-| Use ability once per fight | Set a flag on round 1 reset, check before using |
-| Manage a cooldown | Set a toggle var, use `#delay` to reset it |
-| Pause bot on resource | Call `.pause`, start a `#ticker` to monitor recovery, call `.unpause` when safe |
-
----
-
-## `miphp.tin` — class: `guild_miphp`
-
-Configures the MIP HP bar display for this guild's resources. The template exposes all four bars (HP, SP, GP1, GP2) and the enemy health:
+**`_strategy_guild`** is the right place for actions that should only happen once per round — offensive abilities, per-round resource usage, queue insertions. The `_strategy_heartbeat` in `common/strategy.tin` already handles the `action_round < mip[round]` gate before it calls your function, so inside `_strategy_guild` you only need to check the game conditions:
 
 ```tintin
-#class {guild_miphp} kill;
-#class {guild_miphp} open;
-
-#var guild_miphp 1;
-
-#alias {_guild_miphp} {
-    #list temp clear;
-    #list temp add {HP:$hp/$hp_max SP:$sp/$sp_max GP1:$gp1/$gp1_max GP2:$gp2/$gp2_max E:$ehealth};
-    #list temp add {H:$my[hp][graph] S:$my[sp][graph] GP1:$my[gp1][graph] GP2:$my[gp2][graph] E:$enemy[graph]};
-    #var hpbar[prompt] $temp;
-};
-
-#class {guild_miphp} close;
-```
-
-Most guilds only use two or three of the four resource bars. Remove the ones that don't apply. For guilds with a custom hpbar command (like gentech's `genset hpbar`), implement that in a `hpbar.tin` file and call `setup_3kdb_hpbar` from your character file.
-
----
-
-## `strategy.tin` — class: `guild_strategy`
-
-Defines what combat actions the guild takes each round. The strategy system (common) calls `_strategy_guild_start` on round 1 and `_strategy_guild` every subsequent round.
-
-The template pattern:
-
-```tintin
-#class {guild_strategy} {kill};
-#class {guild_strategy} {open};
-
-#NOP -- Register your strategies in strategyList;
-#list strategyList add {{{guild} {myguild} {name} {fireball} {active} {0} {description} {MyGuild: Cast fireball every round}}};
-#list strategyList indexate name;
-
-#NOP -- Actions to perform at any time in the fight;
 #alias {_strategy_guild} {
     #if {$enemy[hp] > 0} {
         checkStrategy {fireball} {
@@ -211,95 +91,218 @@ The template pattern:
         };
     };
 };
+```
 
-#NOP -- Actions to perform the first rounds of combat;
+If you put per-round actions in `_guild_heartbeat` without your own round gate, they fire up to 30 times per round. If you put continuous maintenance in `_strategy_guild`, it only fires once per round and will lag by up to 2 seconds.
+
+---
+
+## `_strategy_guild_start`: first-round openers
+
+`_strategy_guild_start` is called by `_strategy_heartbeat` only on rounds 1–3 of a fight. This is where opening moves go — debuffs that should land early, cooldown abilities that fire once per fight, initial setup.
+
+```tintin
 #alias {_strategy_guild_start} {
-    checkStrategy {debuff} {cast slow};
+    checkStrategy {slow} {cast slow};
+    checkStrategy {debuff} {cast feeblemind};
 };
-
-#class {guild_strategy} {close};
 ```
 
-**`checkStrategy {name} {code}`:** Runs `{code}` only if the strategy named `{name}` is currently active. The player toggles strategies with `strategy <name>`. This lets the same script handle multiple play styles without code changes.
-
-**Registering a strategy:** The `#list strategyList add` line makes the strategy visible in `strategy list` and toggleable. Fields:
-- `guild` — which guild owns it (informational)
-- `name` — the key used in `checkStrategy`
-- `active` — 0 = off by default, 1 = on by default
-- `description` — shown in `strategy list`
-
-**`_strategy_guild_start`:** For openers that should only happen on round 1 — debuffs, first-round offensive cooldowns, opening moves. The common system calls this once at the start of each fight.
+Because `_strategy_heartbeat` gates on `action_round < mip[round]`, this function fires at most once per round — meaning it can be called on round 1, round 2, and round 3 if the conditions are met on all three.
 
 ---
 
-## `tickers.tin` — class: `guild_tickers`
+## `_strategy_heartbeat` and the guild dispatch list
 
-Repeating timers using `#ticker`. Empty in the template:
+`_strategy_heartbeat` in `common/strategy.tin` does not call `_strategy_guild` dynamically. It has a hardcoded list of guild names:
 
 ```tintin
-#class {guild_tickers} {kill}
-#class {guild_tickers} {open}
-
-#class {guild_tickers} {close}
+#if {"$guild" == "necromancer"} {_strategy_guild};
+#if {"$guild" == "fremen"} {_strategy_guild};
+#if {"$guild" == "mage"} {_strategy_guild};
+// ... every other guild ...
 ```
 
-Common uses:
+**This means if you create a new guild and do not add it to this list, `_strategy_guild` will never be called.** The heartbeat will still fire, and `_guild_heartbeat` will still work, but your strategy automation will be silently skipped.
+
+When you create a new guild, add two lines to `common/strategy.tin` — one in the `_strategy_guild_start` block and one in the `_strategy_guild` block:
 
 ```tintin
-#ticker {mana_check} {
-    #if {$my[sp][current] < 200} {
-        #echo {<dcc>Warning: SP low<088>};
+#if {"$guild" == "myguild"} {_strategy_guild_start};
+...
+#if {"$guild" == "myguild"} {_strategy_guild};
+```
+
+---
+
+## `checkStrategy`: how the toggle system works
+
+`checkStrategy` is defined in `common/strategy.tin`. Its full signature is:
+
+```tintin
+checkStrategy {name} {if-active} {if-inactive}
+```
+
+The third argument is optional. When present, it runs if the strategy is *not* active. This is used in places where you want a default behaviour that the strategy overrides:
+
+```tintin
+checkStrategy {gemino} {
+    preserve gemino remains;
+} {
+    // If gemino strategy is off, do the standard preserve
+    preserve get;
+};
+```
+
+Strategies are stored in `strategyActive` (a list of currently toggled-on strategies) and `strategyList` (all registered strategies with metadata). A strategy must be registered in `strategyList` before it can be toggled. Registration happens in `strategy.tin`:
+
+```tintin
+#list strategyList add {{{guild} {myguild} {name} {fireball} {active} {0} {description} {Cast fireball}}};
+#list strategyList indexate name;
+```
+
+The player runs `strategy fireball` to toggle it on/off. `strategies` shows active and inactive lists. `strategy-list` shows every registered strategy.
+
+---
+
+## `miphp.tin`: the `guild_miphp` contract
+
+`common/miphp.tin`'s heartbeat ticker only calls `_guild_miphp` if `$guild_miphp == 1`. The template sets this:
+
+```tintin
+#var guild_miphp 1;
+```
+
+Without that variable set, your HP bar override never runs and the common HP bar is used instead.
+
+`_guild_miphp` populates `$hpbar[prompt]` — the variable the drawing system reads to render the HP bar. It runs every tick so the bar always reflects current values.
+
+The template format shows all four resource bars plus enemy health:
+
+```tintin
+#alias {_guild_miphp} {
+    #list temp clear;
+    #list temp add {HP:$hp/$hp_max SP:$sp/$sp_max GP1:$gp1/$gp1_max GP2:$gp2/$gp2_max E:$ehealth};
+    #list temp add {H:$my[hp][graph] S:$my[sp][graph] GP1:$my[gp1][graph] GP2:$my[gp2][graph] E:$enemy[graph]};
+    #var hpbar[prompt] $temp;
+};
+```
+
+Trim this to only the resources your guild actually uses. For guilds with their own hpbar system (gentech uses `genset hpbar`, jedi has `hpbar.tin`), the `setup_3kdb_hpbar` alias sends the configuration command to the MUD rather than populating `hpbar[prompt]` directly.
+
+---
+
+## `actions.tin`: triggers that run all the time
+
+Unlike `heartbeat.tin`, actions defined here are not called — they fire reactively whenever the MUD sends matching output. That distinction matters:
+
+- A `#action` fires as soon as the pattern appears in the MUD stream, regardless of the heartbeat tick cadence
+- It fires even when `$idle_flag` is set, because TinTin++ pattern matching doesn't check your variables
+
+If you have an action that should not fire when the bot is paused, add a guard inside the action body:
+
+```tintin
+#action {^Your fireball hits %* for %d damage!} {
+    #if !$idle_flag {
+        #math stats[fireball_total] {$stats[fireball_total] + %2};
     };
-} {10};
+};
 ```
 
-Tickers run whether or not you are in combat. Use `$idle_flag` and `$incombat` guards if you only want them active in certain states.
+Actions in the `guild_actions` class are killed and reloaded by `.gswap` exactly like aliases. This means you cannot accidentally have bard combat triggers firing while playing necromancer.
 
 ---
 
-## Optional files
+## `gags.tin`: why specific patterns matter
 
-| File | Class | Purpose |
-|---|---|---|
-| `vars.tin` | `guild_vars` | Default variables, data tables, costs. Loaded once at guild load. |
-| `eval.tin` | `guild_eval` | Parse `evaluate` / `appraise` output and build tables. Used by bard for resistance grids. |
-| `hpbar.tin` | — | Send hpbar setup commands for guilds with their own hpbar system (e.g. `setup_3kdb_hpbar`). |
-| `data.tin` | `guild_data` | Static reference data — spell lists, power tables, cost tables. |
-| `summoner.tin` | `guild_summoner` | Summon management logic (mage). |
-| `pstats.tin` | — | Performance stat tracking. |
+`#gag` suppresses a line of MUD output completely — it never reaches the screen or any later action. The `guild_gags` class is killed on swap, so guild-specific gags do not bleed.
 
----
+The risk with gags is being too broad. Every gag pattern is matched against every line of MUD output on every tick. A pattern like:
 
-## Class names and `.gswap`
+```tintin
+#gag {You cast}
+```
 
-Every guild class follows the naming convention `guild_*`. The `.gswap <guild>` command kills all these classes before loading the new guild, which is how guild swapping works cleanly at runtime:
+will suppress spell announcements for every guild, not just yours, because gags in the common class survive guild swaps and gags in `guild_gags` are only killed on swap. A pattern like:
 
-| Class | Description |
-|---|---|
-| `guild_actions` | Trigger patterns |
-| `guild_aliases` | Commands |
-| `guild_data` | Static data |
-| `guild_eval` | Evaluate parsers |
-| `guild_gags` | Spam filters |
-| `guild_heartbeat` | Per-round logic |
-| `guild_hpbar` | HP bar setup |
-| `guild_mage_defense_tracker` | Mage-specific defense tracker |
-| `guild_miphp` | MIP bar configuration |
-| `guild_summoner` | Summon management |
-| `guild_tickers` | Repeating timers |
-| `guild_vars` | Default variables |
-| `guild_strategy` | Combat strategy |
+```tintin
+#gag {^You begin casting Rainbow of Death.$}
+```
+
+is safe because it only matches one specific string.
+
+Anchoring with `^` (start of line) and `$` (end of line) makes patterns faster and prevents accidental partial matches.
 
 ---
 
-## Creating a new guild: checklist
+## `vars.tin`: data that loads once
 
-1. Copy `common/guilds/guild template/` → `common/guilds/myguild/`
-2. Add `#read common/guilds/$guild/strategy.tin;` to `index.tin` if you want strategies
-3. Add optional files (`vars.tin`, `eval.tin`, etc.) to `index.tin` as needed
-4. Write `aliases.tin` — start here, it's the most immediately useful
-5. Write `strategy.tin` — register at least one strategy even if empty
-6. Write `heartbeat.tin` — add resource maintenance and per-round logic
-7. Write `miphp.tin` — trim the template to show only the resource bars your guild uses
-8. Register aliases in `library3kdb` with `.add_library` inside guild guards
-9. Set `#var guild myguild` in your character file and reload
+`vars.tin` is not in the default `index.tin` template — you have to add it. It belongs between `aliases.tin` and `heartbeat.tin` in the load order since the heartbeat may reference variables set here.
+
+Use `vars.tin` for:
+- Threshold constants the heartbeat reads (`$karma_use_corpse_between_songs 650`)
+- Cost tables the heartbeat checks (`$protCosts[harmonic regeneration][sp] 268`)
+- Song/spell/power lists used by strategy logic
+- Anything you might want to tune without editing heartbeat logic
+
+Do not put aliases in `vars.tin`. They will not be in the `guild_aliases` class and will not be killed on `.gswap`.
+
+---
+
+## `tickers.tin`: timers that survive outside combat
+
+`#ticker` definitions run continuously on a fixed interval, independent of the heartbeat system. They are not gated by `$mip[round]` or `$action_round`. They keep running when you are out of combat, when the bot is paused, when you are navigating between areas.
+
+```tintin
+#ticker {sp_warn} {
+    #if {$my[sp][current] < 100} {
+        #echo {<dcc>LOW SP WARNING<088>};
+    };
+} {5};
+```
+
+Because they run unconditionally, tickers should guard on `$idle_flag` and `$incombat` where appropriate. A ticker that tries to cast a spell when you are walking between rooms will spam errors.
+
+The `guild_tickers` class is killed on `.gswap`, so tickers defined here do not survive a guild change.
+
+---
+
+## File load order and dependencies
+
+The template `index.tin` reads files in this order:
+
+```
+aliases.tin   ← defines commands
+actions.tin   ← defines triggers
+gags.tin      ← defines suppression
+heartbeat.tin ← may call aliases defined above
+miphp.tin     ← reads hp/sp vars, runs every tick
+tickers.tin   ← timers
+```
+
+`strategy.tin` is not in the default template — add it explicitly. It should load after `aliases.tin` because `_strategy_guild` and `_strategy_guild_start` often call guild aliases.
+
+If you add `vars.tin`, it should load before `heartbeat.tin` and `strategy.tin`:
+
+```tintin
+#read common/guilds/$guild/aliases.tin;
+#read common/guilds/$guild/vars.tin;      ← add this
+#read common/guilds/$guild/actions.tin;
+#read common/guilds/$guild/gags.tin;
+#read common/guilds/$guild/heartbeat.tin;
+#read common/guilds/$guild/strategy.tin;  ← add this
+#read common/guilds/$guild/miphp.tin;
+#read common/guilds/$guild/tickers.tin;
+```
+
+---
+
+## Creating a new guild: what the system requires
+
+Beyond writing the files, there are two things the common system needs before your guild works fully:
+
+1. **Add to the `_strategy_heartbeat` dispatch list in `common/strategy.tin`** — both the `_strategy_guild_start` block and the `_strategy_guild` block need a line for your guild name. Without this, strategy automation is silently disabled.
+
+2. **Set `#var guild_miphp 1` in `miphp.tin`** if you want your HP bar override to run. Without it the common HP bar is used.
+
+Everything else — aliases, actions, gags, heartbeat — activates automatically as long as `index.tin` reads the right files and the classes are structured correctly.
